@@ -1,0 +1,38 @@
+[package]
+name = "wa-call"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "WhatsApp voice/video calls from the command line: a daemon plus a control CLI, on whatsapp-rust"
+publish = false
+
+[features]
+default = ["voip-mlow", "voip-opus"]
+voip-mlow = ["whatsapp-rust/voip-mlow"]
+voip-opus = ["whatsapp-rust/voip-encoded", "whatsapp-rust/voip-libopus"]
+
+# Pinned to one upstream commit: the call protocol is reverse-engineered and moves weekly, so an
+# upgrade is a deliberate bump of `rev` (here and in both lines) followed by a live test call.
+[dependencies]
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "b84f2af3d4029612a3c0cd45823bced1ee4614eb", features = [
+    "sqlite-storage",
+    "tokio-transport",
+    "ureq-client",
+    "tokio-native",
+    # Without this the build succeeds and every call fails at "no relay media transport".
+    "voip-relay-native",
+] }
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "b84f2af3d4029612a3c0cd45823bced1ee4614eb", features = ["voip"] }
+anyhow = "1.0"
+async-channel = "2.5"
+bytes = "1.12"
+clap = { version = "4", features = ["derive", "env"] }
+env_logger = "0.11"
+hex = "0.4"
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.53", features = ["full"] }
+
+[profile.release]
+debug = false

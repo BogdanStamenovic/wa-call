@@ -1,0 +1,15 @@
+[Unit]
+Description=wa-call: WhatsApp call daemon (linked companion device)
+Documentation=https://github.com/BogdanStamenovic/wa-call
+# Without a linked session the daemon would only sit there printing QR codes.
+ConditionPathExists=%S/wa-call/linked
+After=pipewire.service
+
+[Service]
+ExecStart=@BIN@ daemon --incoming ring
+Restart=on-failure
+RestartSec=10
+Environment=RUST_LOG=warn,wa_call=info
+
+[Install]
+WantedBy=default.target

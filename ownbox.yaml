@@ -1,0 +1,14 @@
+name: wa-call
+description: WhatsApp voice and video calls from the command line — a daemon on whatsapp-rust plus a control CLI.
+tags: [whatsapp, calls, voip, cli]
+install:
+  setup:
+    - scripts/setup.sh
+  # Rebuilds at the pinned whatsapp-rust rev and restarts the daemon if it was running. The
+  # session lives in ~/.local/state/wa-call, outside the checkout, so neither update nor
+  # rollback touches it.
+  update:
+    - scripts/setup.sh
+  remove:
+    - scripts/remove.sh
+command: target/release/wa-call
