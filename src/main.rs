@@ -113,6 +113,10 @@ struct Media {
     /// PipeWire node to play to.
     #[arg(long)]
     speaker: Option<String>,
+    /// Exchange raw s16le 16 kHz mono audio with a program listening on this Unix socket
+    /// (instead of --play/--live): the peer is written to it, what it writes is sent.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<PathBuf>,
     /// Video call / answer with video.
     #[arg(long)]
     video: bool,
@@ -144,6 +148,7 @@ impl Media {
                 live: self.live,
                 capture_target: self.mic.clone(),
                 playback_target: self.speaker.clone(),
+                socket: self.socket.as_ref().map(abs),
             },
             video: self.video,
             video_input: self.video_input.clone(),

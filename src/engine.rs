@@ -392,7 +392,10 @@ impl EventHandler for CallObserver {
         match &*event {
             Event::IncomingCall(call) => match &call.action {
                 CallAction::Offer {
-                    call_id, is_video, ..
+                    call_id,
+                    is_video,
+                    caller_pn,
+                    ..
                 } => {
                     let call: IncomingCall = (**call).clone();
                     let cid = call_id.clone();
@@ -400,6 +403,8 @@ impl EventHandler for CallObserver {
                     let peer = json!({
                         "call_id": cid, "peer": call.from.to_string(),
                         "name": call.notify, "video": is_video, "direction": "incoming",
+                        // `peer` may be a LID, which is not a phone number; this is.
+                        "caller_pn": caller_pn.as_ref().map(|j| j.to_string()),
                     });
                     {
                         let mut st = lock_call_state(&self.state);
@@ -435,6 +440,31 @@ impl EventHandler for CallObserver {
                             });
                         }
                     }
+                }
+                // The answers to a call WE placed. `preaccept` is the callee's device saying
+                // it is alerting: the only evidence a caller gets that the phone actually rang.
+                CallAction::PreAccept { call_id, .. } => {
+                    info!("🔔 {} is ringing for call {call_id}", call.from);
+                    emit(
+                        "peer-ringing",
+                        json!({"call_id": call_id, "peer": call.from.to_string()}),
+                    );
+                }
+                CallAction::Accept { call_id, .. } => {
+                    info!("✅ {} accepted call {call_id}", call.from);
+                    emit("accepted", json!({"call_id": call_id, "peer": call.from.to_string()}));
+                }
+                CallAction::Reject {
+                    call_id, reason, ..
+                } => {
+                    // No reason is the person declining. `busy`/`enc` are one device that cannot
+                    // take it, while their other devices may still ring.
+                    info!("✋ {} rejected call {call_id} ({reason:?})", call.from);
+                    emit(
+                        "rejected",
+                        json!({"call_id": call_id, "peer": call.from.to_string(),
+                               "reason": reason, "declined": reason.is_none()}),
+                    );
                 }
                 CallAction::Terminate { call_id, .. } => {
                     info!("◀ peer ended call {call_id}");
@@ -661,9 +691,8 @@ async fn start_media(
 ) -> std::result::Result<Arc<CallHandle>, (InboundMediaFailureStage, anyhow::Error)> {
     let voip = client.voip();
     let (builder, event_speaker, video_recovery, done) = async {
-        let source = crate::audio::spawn_source(&spec.audio)?;
+        let (source, speaker) = crate::audio::spawn_endpoints(&spec.audio)?;
         let mic = source.frames;
-        let speaker = crate::audio::spawn_sink(&spec.audio)?;
         let event_speaker = speaker.clone();
         info!("🔌 connecting media via client.voip().accept(..)…");
         let (video_endpoints, video_recovery) = if initial_video {
@@ -735,9 +764,8 @@ async fn place_outgoing_call(
     spec: &CallSpec,
 ) -> Result<Arc<CallHandle>> {
     let video = spec.video;
-    let source = crate::audio::spawn_source(&spec.audio)?;
+    let (source, speaker) = crate::audio::spawn_endpoints(&spec.audio)?;
     let mic = source.frames;
-    let speaker = crate::audio::spawn_sink(&spec.audio)?;
     let event_speaker = speaker.clone();
     info!("📞 placing call to {peer} via client.voip().call(..)…");
     let voip = client.voip();
@@ -842,6 +870,12 @@ fn spawn_call_event_listener(
                 CallEvent::RelayAllocated => {
                     info!("🛰  relay allocate acknowledged — media path live");
                     emit("connected", json!({"call_id": handle.call_id()}));
+                }
+                // Unlike `connected`, never raised while the peer is still ringing: the call was
+                // accepted and its media plane is up.
+                CallEvent::MediaConnected => {
+                    info!("🎙  media connected for call {}", handle.call_id());
+                    emit("media-connected", json!({"call_id": handle.call_id()}));
                 }
                 CallEvent::RelayAllocateFailed(code) => {
                     warn!("relay rejected the allocate (STUN error {code}) — media never came up")

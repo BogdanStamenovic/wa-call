@@ -29,6 +29,12 @@ wa-call events ──┘                                                   │
   - `--live` uses `pw-cat` for capture and playback.
   - `--record` writes a streaming WAV. Its header is patched on close, so a crash still leaves
     readable audio.
+  - `--socket PATH` exchanges raw s16le 16 kHz mono with another program that listens on a Unix
+    socket: the daemon connects when the call's media is set up, writes the peer to it and sends
+    what it reads. The other program keeps the clock. Before the call is answered nothing drains
+    what it sends, so at most two 60 ms frames are queued and the rest are dropped; otherwise the
+    stale audio would become a fixed delay for the whole call. hotline-call uses this mode to put
+    its voice agent on WhatsApp calls.
   - With neither `--play` nor `--live`, the call sends real-time silence.
 - **Video** uses upstream's ffmpeg H.264 path. The input is `--video-input testsrc|FILE|/dev/videoN`.
   The peer's video goes to a file by default, since the daemon has no screen.
@@ -61,6 +67,7 @@ systemctl --user start wa-call
 
 wa-call dial +381601112233 --play greeting.mp3 --record reply.wav --hangup-after-play --wait
 wa-call dial +381601112233 --live                       # talk through PipeWire
+wa-call dial +381601112233 --socket /run/user/1000/me.sock   # another program does the talking
 wa-call dial +381601112233 --video --video-input testsrc
 
 wa-call events                                          # NDJSON: ringing, dialing, connected, ended, …
@@ -77,9 +84,13 @@ Every event is also appended to `~/.local/state/wa-call/calls.jsonl`.
 | Event | When |
 |---|---|
 | `online` / `unlinked` / `logged-out` | session state |
-| `ringing` | incoming offer (`call_id`, `peer`, `name`, `video`) |
+| `ringing` | incoming offer (`call_id`, `peer`, `caller_pn`, `name`, `video`); `peer` may be a LID, `caller_pn` is the phone number when WhatsApp sends one |
 | `dialing` / `answered` | we placed or accepted a call |
-| `connected` | relay allocated, media flowing |
+| `peer-ringing` | the callee's device sent `preaccept`: it is alerting. The only evidence that an outgoing call actually rang |
+| `accepted` | the callee accepted our call |
+| `rejected` | a callee device refused (`reason`); `declined: true` when there is no reason, i.e. the person declined. `busy`/`enc` are one device, and their others may still ring |
+| `connected` | relay allocated. Upstream raises this while the peer may still be ringing, so it is not proof of an answer |
+| `media-connected` | the call was accepted and its media plane is up |
 | `ended` | `by: peer\|us`, `unanswered`, `rejected`, `note` |
 | `media-ended` | the media plane for a call is torn down |
 | `missed` | an offer delivered after the fact (on reconnect) |
@@ -104,3 +115,6 @@ Every event is also appended to `~/.local/state/wa-call/calls.jsonl`.
 - **Not yet verified against a live call from this tool.** The engine is upstream's, and that
   upstream has working two-way calls. The first live test should check that a call lasts longer
   than 30 s, because one other stack reports calls being cut at around 20 s.
+- **`peer-ringing`, `accepted`, `rejected` and `media-connected` are read off upstream's code, not
+  seen on a live call yet.** Upstream dispatches `preaccept`/`accept`/`reject` stanzas as events,
+  and wa-call now forwards them; whether every WhatsApp client sends `preaccept` is unverified.

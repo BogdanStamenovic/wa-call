@@ -36,12 +36,112 @@ pub struct AudioSpec {
     pub live: bool,
     pub capture_target: Option<String>,
     pub playback_target: Option<String>,
+    /// Exchange audio with another program over this Unix stream socket, which that program is
+    /// listening on: the daemon connects when the call's media is set up, writes the peer to it
+    /// and reads what to send from it, both as raw s16le, 16 kHz, mono. Takes precedence over
+    /// `play`/`live`. The other side keeps the clock, so nothing read from it is paced here.
+    #[serde(default)]
+    pub socket: Option<PathBuf>,
 }
 
 /// Source frames for the engine. `done` fires when a non-looping `play` file has ended.
 pub struct Source {
     pub frames: async_channel::Receiver<Vec<i16>>,
     pub done: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Both ends of a call's audio: what the engine sends, and where what it receives goes.
+pub fn spawn_endpoints(spec: &AudioSpec) -> Result<(Source, async_channel::Sender<Vec<i16>>)> {
+    if let Some(path) = &spec.socket {
+        return spawn_socket(path, spec.record.clone());
+    }
+    Ok((spawn_source(spec)?, spawn_sink(spec)?))
+}
+
+/// The `socket` mode. One connection carries both directions, so the far program cannot mix up
+/// which call a stream belongs to.
+fn spawn_socket(
+    path: &Path,
+    record: Option<PathBuf>,
+) -> Result<(Source, async_channel::Sender<Vec<i16>>)> {
+    let std_stream = std::os::unix::net::UnixStream::connect(path)
+        .with_context(|| format!("connecting the audio socket {}", path.display()))?;
+    std_stream.set_nonblocking(true)?;
+    let stream = tokio::net::UnixStream::from_std(std_stream)?;
+    let (mut reader, mut writer) = stream.into_split();
+    info!("audio over socket {}", path.display());
+
+    // Small and lossy on purpose. Before the peer answers nothing drains the source, and a deep
+    // queue would then hold stale audio that every later frame queues behind: a constant delay
+    // for the rest of the call. Two frames bound that at 120 ms; extra frames are dropped.
+    let (tx, rx) = async_channel::bounded::<Vec<i16>>(2);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; FRAME_BYTES];
+        let mut dropped: u64 = 0;
+        loop {
+            match reader.read_exact(&mut buf).await {
+                Ok(_) => {
+                    let frame = buf
+                        .chunks_exact(2)
+                        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                        .collect();
+                    match tx.try_send(frame) {
+                        Ok(()) => {}
+                        Err(async_channel::TrySendError::Full(_)) => dropped += 1,
+                        Err(async_channel::TrySendError::Closed(_)) => return,
+                    }
+                }
+                Err(e) => {
+                    debug!("audio socket closed its sending side: {e}");
+                    break;
+                }
+            }
+        }
+        if dropped > 0 {
+            debug!("audio socket: dropped {dropped} frame(s) nobody was ready for");
+        }
+        let _ = done_tx.send(());
+        let mut tick = tokio::time::interval(FRAME_PERIOD);
+        loop {
+            tick.tick().await;
+            if tx.send(vec![0; FRAME_SAMPLES]).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    let (sink_tx, sink_rx) = async_channel::bounded::<Vec<i16>>(16);
+    tokio::spawn(async move {
+        let mut wav = match &record {
+            Some(path) => WavWriter::create(path).await.ok(),
+            None => None,
+        };
+        let mut open = true;
+        while let Ok(frame) = sink_rx.recv().await {
+            let bytes: Vec<u8> = frame.iter().flat_map(|s| s.to_le_bytes()).collect();
+            if let Some(w) = wav.as_mut()
+                && w.write(&bytes).await.is_err()
+            {
+                wav = None;
+            }
+            if open && writer.write_all(&bytes).await.is_err() {
+                warn!("audio socket closed its receiving side");
+                open = false;
+            }
+        }
+        if let Some(w) = wav {
+            let _ = w.finish().await;
+        }
+        let _ = writer.shutdown().await;
+    });
+    Ok((
+        Source {
+            frames: rx,
+            done: done_rx,
+        },
+        sink_tx,
+    ))
 }
 
 pub fn spawn_source(spec: &AudioSpec) -> Result<Source> {
@@ -254,6 +354,60 @@ mod tests {
         assert_eq!(b.len(), 48);
         assert_eq!(u32::from_le_bytes(b[40..44].try_into().unwrap()), 4);
         assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 40);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn socket_mode_carries_both_directions() {
+        let dir = std::env::temp_dir().join(format!("wa-call-sock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let spec = AudioSpec {
+            socket: Some(path.clone()),
+            ..Default::default()
+        };
+        let (src, sink) = spawn_endpoints(&spec).unwrap();
+        let (mut far, _) = listener.accept().await.unwrap();
+        // What the far program sends arrives as engine frames...
+        let mut said = Vec::new();
+        for i in 0..FRAME_SAMPLES as i16 {
+            said.extend_from_slice(&i.to_le_bytes());
+        }
+        far.write_all(&said).await.unwrap();
+        let got = src.frames.recv().await.unwrap();
+        assert_eq!(got.len(), FRAME_SAMPLES);
+        assert_eq!(got[5], 5);
+        // ...and what the peer says arrives at the far program as raw s16le.
+        sink.send(vec![7i16; FRAME_SAMPLES]).await.unwrap();
+        let mut heard = vec![0u8; FRAME_BYTES];
+        far.read_exact(&mut heard).await.unwrap();
+        assert_eq!(i16::from_le_bytes([heard[0], heard[1]]), 7);
+        // Closing the far side ends the source, which then keeps the call fed with silence.
+        drop(far);
+        let mut src = src;
+        tokio::time::timeout(Duration::from_secs(2), &mut src.done).await.unwrap().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn socket_mode_drops_rather_than_queues() {
+        let dir = std::env::temp_dir().join(format!("wa-call-sockq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("q.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let spec = AudioSpec {
+            socket: Some(path.clone()),
+            ..Default::default()
+        };
+        let (src, _sink) = spawn_endpoints(&spec).unwrap();
+        let (mut far, _) = listener.accept().await.unwrap();
+        // Ten frames while nothing consumes: only the first two may be kept.
+        for n in 0..10i16 {
+            far.write_all(&vec![n as u8, 0].repeat(FRAME_SAMPLES)).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(src.frames.len(), 2);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
